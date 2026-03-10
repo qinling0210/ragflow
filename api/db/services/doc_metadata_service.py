@@ -474,7 +474,7 @@ class DocMetadataService:
 
             # For Infinity or as fallback: use delete+insert
             logging.debug(f"[update_document_metadata] Using delete+insert method for doc_id: {doc_id}")
-            cls.delete_document_metadata(doc_id, kb_id, tenant_id, skip_empty_check=True)
+            cls.delete_document_metadata(doc_id, kb_id, tenant_id)
             return cls.insert_document_metadata(doc_id, processed_meta)
 
         except Exception as e:
@@ -483,17 +483,15 @@ class DocMetadataService:
 
     @classmethod
     @DB.connection_context()
-    def delete_document_metadata(cls, doc_id: str, kb_id: str, tenant_id: str = None, skip_empty_check: bool = False) -> bool:
+    def delete_document_metadata(cls, doc_id: str, kb_id: str, tenant_id: str = None) -> bool:
         """
         Delete document metadata from ES/Infinity.
-        Also drops the metadata table if it becomes empty (efficiently).
         If document has no metadata in the table, this is a no-op.
 
         Args:
             doc_id: Document ID
             kb_id: Knowledge base ID
             tenant_id: Tenant ID, if not provided, get it from kb_id
-            skip_empty_check: If True, skip checking/dropping empty table (for bulk deletions)
 
         Returns:
             True if successful (or no metadata to delete), False otherwise
@@ -529,9 +527,6 @@ class DocMetadataService:
                 logging.debug(f"[METADATA DELETE] Get result: {existing_metadata is not None}")
                 if not existing_metadata:
                     logging.debug(f"[METADATA DELETE] Document {doc_id} has no metadata in table, skipping deletion")
-                    # Only check/drop table if not skipped (tenant deletion will handle it)
-                    if not skip_empty_check:
-                        cls._drop_empty_metadata_table(index_name, tenant_id)
                     return True  # No metadata to delete is success
             except Exception as e:
                 # If get fails, document might not exist in metadata table, which is fine
@@ -548,12 +543,6 @@ class DocMetadataService:
                 kb_id  # Pass actual kb_id (delete() will handle metadata tables correctly)
             )
             logging.debug(f"[METADATA DELETE] Deleted count: {deleted_count}")
-
-            # Only check if table should be dropped if not skipped (for bulk operations)
-            # Note: delete operation already uses refresh=True, so data is immediately available
-            if not skip_empty_check:
-                # Check by querying the actual metadata table (not MySQL)
-                cls._drop_empty_metadata_table(index_name, tenant_id)
 
             logging.debug(f"Successfully deleted metadata for document {doc_id}")
             return True
@@ -1142,7 +1131,7 @@ class DocMetadataService:
                     logging.debug(f"[batch_update_metadata] Updating doc_id: {doc_id}, meta: {meta}")
                     # If metadata is empty, delete the row entirely instead of keeping empty metadata
                     if not meta:
-                        cls.delete_document_metadata(doc_id, kb_id, tenant_id=None, skip_empty_check=True)
+                        cls.delete_document_metadata(doc_id, kb_id, tenant_id=None)
                     else:
                         cls.update_document_metadata(doc_id, meta)
                     updated_docs += 1

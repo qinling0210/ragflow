@@ -51,7 +51,7 @@ class TestMetadataBatchUpdate:
 
         # Verify the API call succeeded
         assert res["code"] == 0, f"Expected code 0, got {res.get('code')}: {res.get('message')}"
-        assert res["data"]["updated"] == 1010, f"Expected 1100 documents updated, got {res['data']['updated']}"
+        assert res["data"]["updated"] == 1010, f"Expected 1010 documents updated, got {res['data']['updated']}"
 
         # Verify metadata was updated for first and last few sample documents
         sample_ids = document_ids[:5] + document_ids[-5:]
