@@ -15,15 +15,17 @@
 #
 
 import asyncio
+import builtins
+import json
+import logging
+import os
 import re
 import time
 from abc import ABC
-import builtins
-import json
-import os
-import logging
 from typing import Any, List, Union
+
 import pandas as pd
+
 from agent import settings
 from common.connection_utils import timeout
 
