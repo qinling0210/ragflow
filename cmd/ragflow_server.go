@@ -28,12 +28,15 @@ import (
 	"ragflow/internal/agent/audio"
 	"ragflow/internal/agent/canvas"
 	"ragflow/internal/agent/retrievalbridge"
+	"ragflow/internal/agent/runtime"
 	agenttool "ragflow/internal/agent/tool"
 	"ragflow/internal/channels"
 	"ragflow/internal/handler"
 	"ragflow/internal/ingestion/knowledge_compile"
 	ingestion "ragflow/internal/ingestion/service"
 	"ragflow/internal/mcp"
+	"ragflow/internal/rag/advanced_rag"
+	"ragflow/internal/rag/advanced_rag/harness"
 	"ragflow/internal/router"
 	"ragflow/internal/server/local"
 	"ragflow/internal/service"
@@ -49,6 +52,7 @@ import (
 	"ragflow/internal/tokenizer"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -61,6 +65,7 @@ import (
 	"ragflow/internal/deepdoc/parser/pdf/inference/native_analyzer"
 	"ragflow/internal/engine"
 	"ragflow/internal/engine/redis"
+	"ragflow/internal/entity"
 	_ "ragflow/internal/ingestion/wire"
 	"ragflow/internal/server"
 	"ragflow/internal/utility"
@@ -775,6 +780,86 @@ func startServer(ctx context.Context) {
 	))
 	agenttool.SetMemoryRetrievalService(retrievalbridge.NewMemoryAdapter(memoryService))
 	common.Info("agent: retrieval service adapter installed")
+
+	// Wire the agentic-RAG harness as the Go chat pipeline's evidence engine
+	// (internal/service/chat_pipeline.retrieveViaHarness). It reads the runtime
+	// retrieval singleton below for search and drives LLM turns through the
+	// process-wide default invoker (production einoChatInvoker installed above
+	// by component.InstallDefaultChatInvoker). Activating the agentic loop here
+	// enables the full planner/SCA path for reasoning chats.
+	//
+	// harnessMu serializes harness LLM turns because the default invoker reads
+	// the process-global default model name (chat.SetDefaultModelName); we pin
+	// it to the requesting tenant's chat model for the duration of the call and
+	// restore the previous value afterwards so concurrent tenants do not use a
+	// stale model.
+	var harnessMu sync.Mutex
+	runtime.SetRetrievalService(retrievalbridge.NewRuntimeAdapter())
+	advanced_rag.SetAgenticLoop(advanced_rag.NewAgenticLoop())
+	service.SetHarnessRetriever(func(ctx context.Context, req service.HarnessRequest) (service.HarnessResult, error) {
+		harnessMu.Lock()
+		defer harnessMu.Unlock()
+
+		// Resolve the tenant's actual chat model and pin it on the harness model
+		// driver, mirroring Python where RAGTools receives a fully-resolved
+		// LLMBundle. chat.LLMID may be a UUID/tenant_model id that the default
+		// invoker cannot split into a provider — pinning the resolved config here
+		// avoids falling through to a dummy driver. If resolution fails we leave
+		// model nil so the harness degrades to a direct search (no dummy fallback).
+		var model harness.SessionModel
+		if req.ModelID != "" {
+			if driver, modelName, apiCfg, contentLen, mErr := modelProviderService.ResolveModelConfig(ctx, req.TenantID, entity.ModelTypeChat, req.ModelID); mErr == nil {
+				if inv := component.NewResolvedInvoker(driver, modelName, apiCfg); inv != nil {
+					// MaxLength mirrors Python LLMBundle.max_length (the model's
+					// context window in tokens); message-fitting nodes (calculate,
+					// structure_qa) use it as their chat.FitMessages budget.
+					model = &harness.InvokerSessionModel{Invoker: inv, DB: dao.DB, MaxLength: contentLen}
+				}
+			} else {
+				common.Warn("harness: failed to resolve chat model for reasoning; harness will degrade to direct search", zap.Error(mErr))
+			}
+		}
+
+		// Load the KB objects (mirroring Python RAGTools' self.kbs via
+		// KnowledgebaseService.get_by_ids(kb_ids)) so the agentic tool can
+		// derive rank features from parser_config.tag_kb_ids. Best-effort: a
+		// load failure leaves KBs empty and the adapter resolves them itself.
+		var kbs []*entity.Knowledgebase
+		if len(req.DatasetIDs) > 0 {
+			if loaded, lErr := dao.NewKnowledgebaseDAO().GetByIDs(ctx, dao.DB, req.DatasetIDs); lErr == nil {
+				kbs = loaded
+			}
+		}
+		deps := advanced_rag.RAGTools{
+			Model:         model,
+			DocIDVerifier: advanced_rag.NewDocIDLookup(),
+			KBs:           kbs,
+			// Tagger is the Go equivalent of Python's label_question
+			// (agentic_rag.py:668): classifies the query into question-type
+			// tags the retriever boosts on. metadataService implements it
+			// (service.MetadataService.LabelQuestion).
+			Tagger: metadataService,
+		}
+		if req.AnswerSink != nil {
+			deps.AnswerSink = &advanced_rag.AnswerSink{
+				OnDelta: req.AnswerSink,
+			}
+		}
+		r := advanced_rag.Rag(ctx, deps, harness.RunRequest{
+			Question:     req.Question,
+			ThinkingMode: req.ThinkingMode,
+			DatasetIDs:   req.DatasetIDs,
+			TenantID:     req.TenantID,
+			SessionID:    req.SessionID,
+		})
+		res := service.HarnessResult{Chunks: r.Chunks, DocAggs: r.DocAggs, Answer: r.Answer}
+		if r.Kbinfos != nil {
+			res.Memory = r.Kbinfos.Memory
+			res.PreSummary = r.Kbinfos.PreSummary
+		}
+		return res, nil
+	})
+	common.Info("agent: harness chat retriever wired (runtime retrieval + agentic loop)")
 
 	// Initialize handler layer
 	authHandler := handler.NewAuthHandler()

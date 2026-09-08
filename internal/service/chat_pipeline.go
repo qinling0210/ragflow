@@ -601,11 +601,14 @@ func (s *ChatPipelineService) AsyncChat(
 		timer.Exit(common.PhaseQueryRefinement)
 
 		// === Phase 9: Retrieval ===
-		promptReasoning, _ := chat.PromptConfig["reasoning"].(bool)
-		kwargReasoning, _ := kwargs["reasoning"].(bool)
-		useReasoning := promptReasoning || kwargReasoning
+		// reasoning is an integer level 0..4 (mirrors Python rag_agent): 0 = off
+		// (regular RAG via async_chat), 1..4 = low/medium/high/ultra (harness
+		// agentic). It comes from the request kwargs first, then prompt_config.
+		reasoningLevel := resolveReasoningLevel(kwargs, map[string]interface{}(chat.PromptConfig))
+		useReasoning := reasoningLevel > 0
 		common.Info("Phase 9: Retrieval",
 			zap.Bool("has_knowledge_param", hasKnowledgeParam),
+			zap.Int("reasoning_level", reasoningLevel),
 			zap.Bool("reasoning", useReasoning))
 
 		timer.Enter(common.PhaseRetrieval)
@@ -632,54 +635,59 @@ func (s *ChatPipelineService) AsyncChat(
 		// When false, the entire block is skipped.
 		if hasKnowledgeParam {
 			if useReasoning && chatModel != nil && len(kbs) > 0 {
-				// DeepResearcher — replaces vector retrieval.
-				// Yields <retrieving> / </retrieving> markers + intermediate messages.
-				docEngine := engine.Get()
-				if docEngine != nil {
-					retSvc := nlp.NewRetrievalService(docEngine, dao.NewDocumentDAO())
-					tenantIDs := kbTenantIDStrings(kbs)
-					kbIDs := kbIDStrings(kbs)
-
-					// KB retrieval callback for the deep researcher
-					kbRetrieve := func(ctx context.Context, q string) (*nlp.RetrievalResult, error) {
-						return retSvc.Retrieval(ctx, &nlp.RetrievalRequest{
-							Question:              q,
-							TenantIDs:             tenantIDs,
-							KbIDs:                 kbIDs,
-							DocIDs:                docIDs,
-							Page:                  1,
-							PageSize:              int(chat.TopN),
-							RerankCandidatesCount: &rerankCandidatesCount,
-							EmbeddingModel:        embModel,
-						})
+				// Reasoning chat (level 1..4): drive the agentic-RAG harness at
+				// the corresponding mode, mirroring Python's dialog_service →
+				// RAGTools → harness/*.
+				//
+				// The harness 'rag' tool composes the final cited answer itself
+				// (terminal tool, mirroring Python). When it returns a non-empty
+				// Answer we emit that answer directly (decorated per Python's
+				// decorate_answer: references resolved, prompt empty) and stop —
+				// there is no second-generation pass in Phase 10/11. Otherwise
+				// we keep its evidence as kbinfos and fall through.
+				thinkingMode := harnessModeForLevel(reasoningLevel)
+				question := strings.Join(questions, " ")
+				// Stream the answer as the harness composes it (Python
+				// tools.answer_sink). The final event below still carries the
+				// complete answer plus references, matching how the non-agentic
+				// path streams deltas and then re-sends the full answer
+				// (dialog_service.py:807).
+				sink := func(delta string, isThink bool) {
+					ev := AsyncChatResult{
+						Reference: map[string]interface{}{},
+						CreatedAt: float64(time.Now().Unix()),
+						Final:     false,
 					}
-
-					dr := NewDeepResearcher(
-						chatModel,
-						map[string]interface{}(chat.PromptConfig),
-						kbRetrieve,
-						useWebSearch,
-						docEngine,
-						kbIDs,
-						tenantIDs,
-						embModel,
-					)
-					question := strings.Join(questions, " ")
-
-					drErr := dr.Research(ctx, kbinfos, question, question, s.deepResearchProgressCallback(ctx, out))
-					if drErr != nil {
-						common.Warn("DeepResearcher failed", zap.Error(drErr))
+					if isThink {
+						ev.Reasoning = delta
 					} else {
-						// kbinfos now contains real chunks with proper
-						// chunk_ids from the recursive tree search.
-						common.Debug("DeepResearcher completed",
-							zap.Int("chunks", len(kbinfos["chunks"].([]map[string]interface{}))))
+						ev.Answer = delta
+					}
+					select {
+					case out <- ev:
+					case <-ctx.Done():
+					}
+				}
+				hk, harnessAnswer, hErr := s.retrieveViaHarness(ctx, question, kbs, thinkingMode, chat.TenantID, chat.LLMID, chat.ID, sink)
+				if hErr != nil {
+					common.Warn("harness retrieval failed", zap.Error(hErr))
+				} else {
+					kbinfos = hk
+					if harnessAnswer != "" {
+						common.Info("harness produced final cited answer; short-circuiting",
+							zap.Int("answer_chars", len(harnessAnswer)))
+						final := s.decorateHarnessAnswer(harnessAnswer, kbinfos)
+						final.Final = true
+						out <- final
+						return
 					}
 				}
 			} else {
+				// Non-reasoning chat (level 0): regular RAG mirroring Python's
+				// async_chat — native docStore retrieval, then the TOC / child
+				// chunk / web search / KG enhancements below.
 				searchQuestion := strings.Join(questions, " ")
 				if embModel != nil {
-					// Retrieval
 					rankFeature := s.MetadataSvc.LabelQuestion(ctx, searchQuestion, kbs)
 					{
 						tenantIDs := make([]string, 0)
@@ -740,22 +748,22 @@ func (s *ChatPipelineService) AsyncChat(
 						common.Warn("Retrieval failed", zap.Error(err))
 						// Continue with empty kbinfos.
 					}
+				}
 
-					// TOC enhancement
-					if useTOC, _ := chat.PromptConfig["toc_enhance"].(bool); useTOC && chatModel != nil && len(kbs) > 0 {
-						enhancer := NewTOCEnhancer(
-							engine.Get(),
-							chatModel,
-							kbTenantIDStrings(kbs),
-							kbIDStrings(kbs),
-							searchQuestion,
-							int(chat.TopN),
-						)
-						if added, err := enhancer.Enhance(ctx, kbinfos); err != nil {
-							common.Warn("TOC enhance failed", zap.Error(err))
-						} else if added > 0 {
-							common.Debug("TOC enhance added chunks", zap.Int("added", added))
-						}
+				// TOC enhancement
+				if useTOC, _ := chat.PromptConfig["toc_enhance"].(bool); useTOC && chatModel != nil && len(kbs) > 0 {
+					enhancer := NewTOCEnhancer(
+						engine.Get(),
+						chatModel,
+						kbTenantIDStrings(kbs),
+						kbIDStrings(kbs),
+						searchQuestion,
+						int(chat.TopN),
+					)
+					if added, err := enhancer.Enhance(ctx, kbinfos); err != nil {
+						common.Warn("TOC enhance failed", zap.Error(err))
+					} else if added > 0 {
+						common.Debug("TOC enhance added chunks", zap.Int("added", added))
 					}
 				}
 
@@ -2936,6 +2944,106 @@ func (s *ChatPipelineService) decorateAnswer(
 	}
 }
 
+// decorateHarnessAnswer mirrors Python's rag_agent decorate_answer used on the
+// reasoning>=1 path (dialog_service.py:2092-2137). The harness 'rag' tool
+// already composed the final answer WITH its own [ID:N] citations, so — unlike
+// decorateAnswer for the native async_chat path — we never run insert_citations
+// here. We only resolve the existing markers, repair bad formats, filter
+// doc_aggs to the cited docs, and build the reference from the harness citation
+// pool (chunks stripped of their vectors). Prompt stays empty, matching Python.
+func (s *ChatPipelineService) decorateHarnessAnswer(answer string, kbinfos map[string]interface{}) AsyncChatResult {
+	think := ""
+	ans := answer
+	if strings.Contains(answer, "</think>") {
+		if parts := strings.Split(answer, "</think>"); len(parts) == 2 {
+			think = parts[0] + "</think>"
+			ans = strings.TrimSpace(parts[1])
+		}
+	}
+
+	chunksRaw, _ := kbinfos["chunks"].([]map[string]interface{})
+
+	// Collect existing [ID:N] markers from the harness answer. Python runs
+	// normalize_arabic_digits then CITATION_MARKER_PATTERN (dialog_service.py:
+	// 2103-2107) and bounds each index by len(chunks).
+	citationIdx := make(map[int]struct{})
+	for _, ci := range ExtractCitationMarkers(ans, len(chunksRaw)) {
+		if ci >= 0 && ci < len(chunksRaw) {
+			citationIdx[ci] = struct{}{}
+		}
+	}
+	// repair_bad_citation_formats (dialog_service.py:2109), then re-scan so any
+	// repaired markers are also honoured.
+	ans = RepairBadCitationFormats(ans)
+	for _, ci := range ExtractCitationMarkers(ans, len(chunksRaw)) {
+		if ci >= 0 && ci < len(chunksRaw) {
+			citationIdx[ci] = struct{}{}
+		}
+	}
+
+	// Map cited chunk indices to doc_ids (dialog_service.py:2111-2122).
+	citedDocIDs := make(map[string]struct{})
+	for ci := range citationIdx {
+		if ci >= 0 && ci < len(chunksRaw) {
+			if docID, ok := chunksRaw[ci]["doc_id"].(string); ok && docID != "" {
+				citedDocIDs[docID] = struct{}{}
+			}
+		}
+	}
+
+	// recall_docs = cited docs, or all when nothing cited (dialog_service.py:
+	// 2124-2127). Only rewrite doc_aggs when we actually found cited docs.
+	if len(citedDocIDs) > 0 {
+		if docAggsRaw, ok := kbinfos["doc_aggs"].([]interface{}); ok && len(docAggsRaw) > 0 {
+			filtered := make([]interface{}, 0, len(docAggsRaw))
+			for _, da := range docAggsRaw {
+				if dam, ok := da.(map[string]interface{}); ok {
+					if docID, ok := dam["doc_id"].(string); ok {
+						if _, cited := citedDocIDs[docID]; cited {
+							filtered = append(filtered, da)
+						}
+					}
+				}
+			}
+			if len(filtered) > 0 {
+				kbinfos["doc_aggs"] = filtered
+			}
+		}
+	}
+
+	// refs = deepcopy(kbinfos) if doc_ids else [] ; drop each chunk's vector
+	// (dialog_service.py:2129-2132). AsyncChatResult.Reference is a map, so an
+	// empty Python [] maps to a nil map (callers/frontend already tolerate a
+	// missing reference).
+	var refs map[string]interface{}
+	if len(citedDocIDs) > 0 {
+		ref := make(map[string]interface{})
+		for k, v := range kbinfos {
+			ref[k] = v
+		}
+		if cRaw, ok := ref["chunks"].([]map[string]interface{}); ok {
+			for _, cm := range cRaw {
+				delete(cm, "vector")
+			}
+			ref["chunks"] = cRaw
+		}
+		refs = ref
+	}
+
+	// Invalid-key hint (dialog_service.py:2134-2135).
+	if strings.Contains(strings.ToLower(ans), "invalid key") ||
+		strings.Contains(strings.ToLower(ans), "invalid api") {
+		ans += " Please set LLM API-Key in 'User Setting -> Model providers -> API-Key'"
+	}
+
+	return AsyncChatResult{
+		Answer:    think + ans,
+		Reference: refs,
+		Prompt:    "",
+		CreatedAt: float64(time.Now().Unix()),
+	}
+}
+
 // langfuseExtractTimeElapsed extracts the time-elapsed + token-usage
 // block from the prompt and applies the \n → "  \n" substitution.
 // Mirrors dialog_service.py:853-854:
@@ -4419,4 +4527,169 @@ func getChunkValue(chunk map[string]interface{}, k1, k2 string) interface{} {
 		return v
 	}
 	return chunk[k2]
+}
+
+// HarnessRequest carries the minimal inputs the chat pipeline hands to the
+// agentic-RAG harness for evidence collection.
+type HarnessRequest struct {
+	Question     string
+	DatasetIDs   []string
+	ThinkingMode string
+	TenantID     string
+	// ModelID is the tenant-scoped chat model id (dialog llm_id). The harness
+	// driver uses it as the default model name for agentic LLM turns.
+	ModelID string
+	// SessionID scopes cross-turn state such as the near-duplicate answer cache
+	// (Python RAGTools._rag_cache lives on an instance spanning the dialog).
+	SessionID string
+	// AnswerSink receives the answer as the model produces it (Python
+	// tools.answer_sink), so the caller can stream instead of waiting for the
+	// whole answer. Nil disables streaming; the full answer is still returned.
+	AnswerSink func(delta string, isThink bool)
+}
+
+// HarnessResult is the evidence the harness returns, normalized to the map
+// shape chat_pipeline's downstream phases already consume.
+type HarnessResult struct {
+	Chunks     []map[string]any
+	DocAggs    []map[string]any
+	Memory     []map[string]any
+	PreSummary string
+	// Answer is the harness's own composed final cited answer (RunResponse.Answer),
+	// populated when a model was available. When non-empty, the chat pipeline uses
+	// it directly as the reply instead of re-generating via a second model pass —
+	// mirroring Python's terminal `rag` tool.
+	Answer string
+}
+
+// harnessRetriever is wired at server bootstrap (cmd/ragflow_server.go) to
+// internal/agent.Run. internal/agent imports internal/service, so the chat
+// pipeline cannot import it directly without an import cycle; we inject the
+// function instead. When nil, retrieveViaHarness reports an error and the
+// pipeline continues with empty kbinfos.
+var harnessRetriever func(ctx context.Context, req HarnessRequest) (HarnessResult, error)
+
+// SetHarnessRetriever injects the agentic-RAG harness driver. Call once at
+// server bootstrap.
+func SetHarnessRetriever(fn func(ctx context.Context, req HarnessRequest) (HarnessResult, error)) {
+	harnessRetriever = fn
+}
+
+// retrieveViaHarness collects evidence chunks for the chat question by driving
+// the agentic-RAG harness, mirroring Python's dialog_service → RAGTools →
+// harness/* path. It returns the same map shape the downstream phases
+// (TOC/child-chunk/web/KG/enrich/kbPrompt) already consume, so the rest of the
+// chat pipeline is unaffected by where the chunks came from.
+//
+// thinkingMode is "naive" (reasoning disabled) or one of the agentic levels
+// ("low"/"medium"/"high"/"ultra", reasoning enabled).
+func (s *ChatPipelineService) retrieveViaHarness(ctx context.Context, question string, kbs []*entity.Knowledgebase, thinkingMode, tenantID, modelID, sessionID string, answerSink func(delta string, isThink bool)) (map[string]interface{}, string, error) {
+	if harnessRetriever == nil {
+		return nil, "", fmt.Errorf("harness retriever not wired at bootstrap")
+	}
+	kbIDs := kbIDStrings(kbs)
+	res, err := harnessRetriever(ctx, HarnessRequest{
+		Question:     question,
+		DatasetIDs:   kbIDs,
+		ThinkingMode: thinkingMode,
+		TenantID:     tenantID,
+		ModelID:      modelID,
+		SessionID:    sessionID,
+		AnswerSink:   answerSink,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	kbinfos := map[string]interface{}{
+		"total":    len(res.Chunks),
+		"chunks":   res.Chunks,
+		"doc_aggs": toAnySlice(res.DocAggs),
+	}
+	if res.Memory != nil {
+		kbinfos["memory"] = res.Memory
+	}
+	if res.PreSummary != "" {
+		kbinfos["pre_summary"] = res.PreSummary
+	}
+	return kbinfos, res.Answer, nil
+}
+
+// toAnySlice widens a []map[string]any to []interface{} so the doc_aggs field
+// keeps the element type the downstream phases expect from the native pipeline.
+func toAnySlice(in []map[string]any) []interface{} {
+	out := make([]interface{}, 0, len(in))
+	for _, m := range in {
+		out = append(out, m)
+	}
+	return out
+}
+
+// asInt64 coerces a JSON-decoded value (float64/json.Number/int/string/bool) to
+// an int64, returning ok=false when the value is absent or not numeric.
+func asInt64(v interface{}) (int64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return int64(t), true
+	case int:
+		return int64(t), true
+	case int64:
+		return t, true
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return n, true
+		}
+	case string:
+		var n int64
+		if _, err := fmt.Sscanf(t, "%d", &n); err == nil {
+			return n, true
+		}
+	case bool:
+		if t {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// resolveReasoningLevel mirrors Python's rag_agent: the requesting reasoning
+// level is taken from the request kwargs first, falling back to the chat
+// prompt_config, and is an integer in 0..4 (0 = off, 1..4 = low/medium/high/
+// ultra). Frontend sends Number(getThinkingLevel()), so the raw value is
+// numeric, not a bool.
+func resolveReasoningLevel(kwargs map[string]interface{}, promptConfig map[string]interface{}) int {
+	if kwargs != nil {
+		if v, ok := kwargs["reasoning"]; ok {
+			if n, ok2 := asInt64(v); ok2 {
+				return int(n)
+			}
+		}
+	}
+	if promptConfig != nil {
+		if v, ok := promptConfig["reasoning"]; ok {
+			if n, ok2 := asInt64(v); ok2 {
+				return int(n)
+			}
+		}
+	}
+	return 0
+}
+
+// harnessModeForLevel maps a Python-style reasoning level to the harness
+// thinking mode. Python uses THINKING_MODES = [low, medium, high, ultra] and
+// falls back to "medium" when n is out of range.
+func harnessModeForLevel(level int) string {
+	switch {
+	case level >= 4:
+		return "ultra"
+	case level == 3:
+		return "high"
+	case level == 2:
+		return "medium"
+	case level == 1:
+		return "low"
+	default:
+		return "medium"
+	}
 }

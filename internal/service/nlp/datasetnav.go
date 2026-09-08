@@ -310,6 +310,58 @@ func (s *NavService) Search(ctx context.Context, tenantID, kbID, query string, e
 	return hits, nil
 }
 
+// SummariesByDocIDs returns the nav_doc summary keyed by doc_id for the given
+// documents. It mirrors Python dataset_api_service._nav_doc_summaries: it reads
+// the nav_doc rows (compile_kwd=dataset_nav, type_kwd=nav_doc) for the doc_ids
+// and yields, per doc, the readable nav name when present, else the payload
+// description. Documents with no nav_doc row are absent from the result.
+func (s *NavService) SummariesByDocIDs(ctx context.Context, tenantID, kbID string, docIDs []string) map[string]string {
+	if len(docIDs) == 0 {
+		return map[string]string{}
+	}
+	chunks, _, err := s.navSearch(ctx, tenantID, kbID,
+		navFilter(map[string]interface{}{
+			"type_kwd": []string{"nav_doc"},
+			"doc_id":   docIDs,
+		}),
+		[]string{"type_kwd", "name", "title_kwd", "content_with_weight", "doc_id"},
+		0, len(docIDs), nil)
+	if err != nil {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(chunks))
+	for _, c := range chunks {
+		docID := firstStringValue(c["doc_id"])
+		if docID == "" {
+			continue
+		}
+		// Prefer an explicit readable name, else the payload description, matching
+		// nodeFromRow's label rules (a raw 32-hex id is not a human label).
+		name := firstStringValue(c["name"])
+		if name == "" {
+			name = firstStringValue(c["title_kwd"])
+		}
+		if graphIsRawID(name) {
+			name = ""
+		}
+		summary := name
+		if summary == "" {
+			if payload, ok := c["content_with_weight"].(string); ok {
+				var m map[string]interface{}
+				if json.Unmarshal([]byte(payload), &m) == nil {
+					if d, ok := m["description"].(string); ok {
+						summary = strings.TrimSpace(d)
+					}
+				}
+			}
+		}
+		if summary != "" {
+			out[docID] = summary
+		}
+	}
+	return out
+}
+
 // UpsertDoc places one document summary into the nav tree. Minimal closed loop:
 // deterministic placement (KNN find best cluster -> merge if sim>=0.80, else a
 // new root-level cluster). No LLM, no split/rebalance, no cascade cleanup.

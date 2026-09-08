@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"slices"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/schema"
+	einojsonschema "github.com/eino-contrib/jsonschema"
 	"gorm.io/gorm"
 
 	"ragflow/internal/agent/chat"
@@ -231,17 +233,329 @@ func (e *einoChatInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvok
 		chatCfg.Thinking = &f
 	}
 	wrapper := models.NewEinoChatModel(cm, chatCfg)
-	out, err := wrapper.Generate(ctx, toEinoMessages(req.Messages))
+	einoMsgs := toEinoMessages(req.Messages)
+	infos, choice := toolOptions(req.Tools, req.ToolChoice)
+	if len(infos) > 0 {
+		withTools, err := wrapper.WithTools(infos)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = withTools.(*models.EinoChatModel).WithToolChoice(choice)
+	}
+	out, err := wrapper.Generate(ctx, einoMsgs)
 	if err != nil {
 		return nil, err
 	}
-	return &ChatInvokeResponse{
+	resp := &ChatInvokeResponse{
 		Content:  out.Content,
 		Thinking: out.ReasoningContent,
 		Model:    modelName,
 		Stopped:  true,
-		Tokens:   0,
-	}, nil
+		Usage:    usageFromCM(cm),
+	}
+	if calls := nativeToolCalls(out.ToolCalls); len(calls) > 0 {
+		resp.ToolCalls = calls
+	}
+	return resp, nil
+}
+
+// usageFromCM copies a ChatModel's LastUsage split into the chat.Response Usage,
+// and mirrors its total into Tokens for the callers that still read the legacy
+// single counter.
+func usageFromCM(cm *models.ChatModel) *chat.Usage {
+	if cm == nil || cm.LastUsage == nil {
+		return nil
+	}
+	return &chat.Usage{
+		PromptTokens:     cm.LastUsage.PromptTokens,
+		CompletionTokens: cm.LastUsage.CompletionTokens,
+		TotalTokens:      cm.LastUsage.TotalTokens,
+	}
+}
+
+// toolOptions converts the seam-level chat.Tool declarations into eino tool
+// infos and a tool_choice string the provider understands. It returns
+// (nil, "") when no tools were requested, so the invoke falls back to plain
+// completion and the harness can still parse tool calls from a fenced block.
+func toolOptions(tools []chat.Tool, choice chat.ToolChoice) ([]*schema.ToolInfo, string) {
+	if len(tools) == 0 {
+		return nil, ""
+	}
+	infos := make([]*schema.ToolInfo, 0, len(tools))
+	for _, t := range tools {
+		name, desc := t.Function.Name, t.Function.Description
+		if name == "" {
+			continue
+		}
+		infos = append(infos, &schema.ToolInfo{
+			Name:        name,
+			Desc:        desc,
+			ParamsOneOf: paramsFromMap(t.Function.Parameters),
+		})
+	}
+	if len(infos) == 0 {
+		return nil, ""
+	}
+	resolved := "auto"
+	switch choice {
+	case chat.ToolChoiceNone:
+		resolved = "none"
+	case chat.ToolChoiceRequired:
+		resolved = "required"
+	case chat.ToolChoiceAuto:
+		resolved = "auto"
+	case "":
+		resolved = "auto"
+	}
+	return infos, resolved
+}
+
+// paramsFromMap builds an eino ParamsOneOf from a raw JSON-schema dict. The
+// harness ToolSpec carries the schema as map[string]any, so we round-trip it
+// through JSON into a jsonschema.Schema. A malformed schema yields a permissive
+// (empty) ParamsOneOf rather than failing the whole call.
+func paramsFromMap(raw map[string]any) *schema.ParamsOneOf {
+	if len(raw) == 0 {
+		return &schema.ParamsOneOf{}
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return &schema.ParamsOneOf{}
+	}
+	var js einojsonschema.Schema
+	if err := json.Unmarshal(b, &js); err != nil {
+		return &schema.ParamsOneOf{}
+	}
+	return schema.NewParamsOneOfByJSONSchema(&js)
+}
+
+// nativeToolCalls converts eino tool calls into the seam's chat.ToolCall values,
+// parsing each call's JSON arguments into a map for direct dispatch. A malformed
+// argument string is left as an empty map rather than dropping the call, so the
+// harness can surface the parse failure through its normal error path.
+func nativeToolCalls(calls []schema.ToolCall) []chat.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]chat.ToolCall, 0, len(calls))
+	for _, c := range calls {
+		args := map[string]any{}
+		if c.Function.Arguments != "" {
+			_ = json.Unmarshal([]byte(c.Function.Arguments), &args)
+		}
+		out = append(out, chat.ToolCall{
+			ID:        c.ID,
+			Name:      c.Function.Name,
+			Arguments: args,
+		})
+	}
+	return out
+}
+
+// Stream satisfies chat.StreamingInvoker: it emits the reply as it arrives
+// while still returning the assembled result, so a caller can push deltas to the
+// user without waiting for the full answer.
+func (e *einoChatInvoker) Stream(ctx context.Context, _ *gorm.DB, req ChatInvokeRequest, onDelta func(delta string, isThink bool) error) (*ChatInvokeResponse, error) {
+	modelName := req.ModelName
+	if modelName == "" {
+		def := chat.GetDefaultModelName()
+		if def == "" {
+			return nil, fmt.Errorf("component: LLM: model_id is required and no default model is configured")
+		}
+		modelName = def
+	}
+	driver, bareModel := req.Driver, modelName
+	if driver == "" && bareModel != "" {
+		if name, provider, ok := splitCompositeLLMID(bareModel); ok {
+			driver, bareModel = provider, name
+		}
+	}
+	if driver == "" {
+		driver = "dummy"
+	}
+	d, err := newChatModelDriver(driver, req.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("component: LLM: resolve driver %q: %w", driver, err)
+	}
+	apiKey := req.APIKey
+	cm := models.NewChatModel(d, &bareModel, &models.APIConfig{ApiKey: &apiKey})
+	chatCfg := &models.ChatConfig{Temperature: req.Temperature, TopP: req.TopP, MaxTokens: req.MaxTokens}
+	switch req.Thinking {
+	case "enabled":
+		t := true
+		chatCfg.Thinking = &t
+	case "disabled":
+		f := false
+		chatCfg.Thinking = &f
+	}
+
+	wrapper := models.NewEinoChatModel(cm, chatCfg)
+	if infos, choice := toolOptions(req.Tools, req.ToolChoice); len(infos) > 0 {
+		withTools, err := wrapper.WithTools(infos)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = withTools.(*models.EinoChatModel).WithToolChoice(choice)
+	}
+	sr, err := wrapper.Stream(ctx, toEinoMessages(req.Messages))
+	if err != nil {
+		return nil, err
+	}
+	defer sr.Close()
+
+	var content, reasoning strings.Builder
+	// Streaming native tool calls arrive as incremental deltas, each carrying an
+	// Index (parallel calls) and a slice of Function.Arguments. Merge them by
+	// index the same way Python's async_chat_streamly aggregates tool_calls
+	// (chat_model.py:711-719): first delta seeds the entry, later deltas append to
+	// the arguments string. The full list is committed once the stream ends.
+	pendingCalls := map[int]*schema.ToolCall{}
+	for {
+		chunk, recvErr := sr.Recv()
+		if recvErr == io.EOF {
+			break
+		}
+		if recvErr != nil {
+			return nil, recvErr
+		}
+		if chunk == nil {
+			continue
+		}
+		// Streaming tool-call deltas are merged before any content handling so a
+		// chunk that carries both is processed exactly once.
+		for _, tc := range chunk.ToolCalls {
+			idx := -1
+			if tc.Index != nil {
+				idx = *tc.Index
+			}
+			existing, ok := pendingCalls[idx]
+			if !ok {
+				cp := tc
+				if cp.Function.Arguments == "" {
+					cp.Function.Arguments = ""
+				}
+				pendingCalls[idx] = &cp
+				continue
+			}
+			existing.Function.Arguments += tc.Function.Arguments
+			if existing.ID == "" && tc.ID != "" {
+				existing.ID = tc.ID
+			}
+			if existing.Function.Name == "" && tc.Function.Name != "" {
+				existing.Function.Name = tc.Function.Name
+			}
+		}
+		// Reasoning is streamed first and flagged, so the caller can render it
+		// separately instead of showing it as part of the answer.
+		if chunk.ReasoningContent != "" {
+			reasoning.WriteString(chunk.ReasoningContent)
+			if onDelta != nil {
+				if err := onDelta(chunk.ReasoningContent, true); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if chunk.Content != "" {
+			content.WriteString(chunk.Content)
+			if onDelta != nil {
+				if err := onDelta(chunk.Content, false); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	resp := &ChatInvokeResponse{
+		Content:  content.String(),
+		Thinking: reasoning.String(),
+		Model:    bareModel,
+		Stopped:  true,
+		Usage:    usageFromCM(cm),
+	}
+	if len(pendingCalls) > 0 {
+		// Preserve provider-given index order (Python's final_tool_calls.values()
+		// is insertion-ordered by index) rather than relying on map iteration.
+		idxs := make([]int, 0, len(pendingCalls))
+		for k := range pendingCalls {
+			idxs = append(idxs, k)
+		}
+		sort.Ints(idxs)
+		merged := make([]schema.ToolCall, 0, len(pendingCalls))
+		for _, k := range idxs {
+			merged = append(merged, *pendingCalls[k])
+		}
+		if calls := nativeToolCalls(merged); len(calls) > 0 {
+			resp.ToolCalls = calls
+		}
+	}
+	return resp, nil
+}
+
+// resolvedModelInvoker is a ChatInvoker pinned to an already-resolved model
+// (driver/modelName/apiConfig). Unlike einoChatInvoker it never consults the
+// process-global default model name nor splits a composite llm id — the caller
+// (e.g. the Go chat pipeline's harness bridge) resolves the tenant model up
+// front via the model provider service. This mirrors Python, where RAGTools
+// receives a fully-resolved LLMBundle, and lets the agentic-RAG harness call a
+// tenant's actual chat model (which may be a UUID/tenant_model id) instead of
+// falling through to a dummy driver.
+type resolvedModelInvoker struct {
+	driver    models.ModelDriver
+	modelName string
+	apiConfig *models.APIConfig
+}
+
+// NewResolvedInvoker builds a ChatInvoker bound to the given resolved model
+// config. modelName may be a bare model name; apiConfig carries the api key and
+// base url already resolved for the tenant.
+func NewResolvedInvoker(driver models.ModelDriver, modelName string, apiConfig *models.APIConfig) ChatInvoker {
+	return &resolvedModelInvoker{driver: driver, modelName: modelName, apiConfig: apiConfig}
+}
+
+// Invoke satisfies ChatInvoker.
+func (c *resolvedModelInvoker) Invoke(ctx context.Context, db *gorm.DB, req ChatInvokeRequest) (*ChatInvokeResponse, error) {
+	modelName := c.modelName
+	if req.ModelName != "" {
+		modelName = req.ModelName
+	}
+	cm := models.NewChatModel(c.driver, &modelName, c.apiConfig)
+	chatCfg := &models.ChatConfig{
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		MaxTokens:   req.MaxTokens,
+	}
+	switch req.Thinking {
+	case "enabled":
+		t := true
+		chatCfg.Thinking = &t
+	case "disabled":
+		f := false
+		chatCfg.Thinking = &f
+	}
+	wrapper := models.NewEinoChatModel(cm, chatCfg)
+	einoMsgs := toEinoMessages(req.Messages)
+	infos, choice := toolOptions(req.Tools, req.ToolChoice)
+	if len(infos) > 0 {
+		withTools, err := wrapper.WithTools(infos)
+		if err != nil {
+			return nil, err
+		}
+		wrapper = withTools.(*models.EinoChatModel).WithToolChoice(choice)
+	}
+	out, err := wrapper.Generate(ctx, einoMsgs)
+	if err != nil {
+		return nil, err
+	}
+	resp := &ChatInvokeResponse{
+		Content:  out.Content,
+		Thinking: out.ReasoningContent,
+		Model:    modelName,
+		Stopped:  true,
+		Usage:    usageFromCM(cm),
+	}
+	if calls := nativeToolCalls(out.ToolCalls); len(calls) > 0 {
+		resp.ToolCalls = calls
+	}
+	return resp, nil
 }
 
 // toEinoMessages converts the LLM component's Message slice to eino's.
@@ -277,6 +591,8 @@ func toEinoMessages(msgs []schema.Message) []*schema.Message {
 			Role:                  role,
 			Content:               m.Content,
 			UserInputMultiContent: cloned,
+			ToolCalls:             m.ToolCalls,
+			ToolCallID:            m.ToolCallID,
 		})
 	}
 	return out
@@ -451,7 +767,7 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 		// The system prompt is already embedded as the first message
 		// in msgs by buildMessagesWithImages; pass "" so fitMessages
 		// does not duplicate it.
-		fitted, fitErr := fitMessages("", msgs, contentLength)
+		fitted, fitErr := chat.FitMessages("", msgs, contentLength)
 		if fitErr != "" {
 			return map[string]any{"content": fitErr}, nil
 		}
@@ -486,7 +802,7 @@ func (c *LLMComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map[strin
 	// Operators who do NOT set MaxRetries (both fields zero) get
 	// the boot retry chain unchanged. The unit tests in
 	// llm_retry_test.go pin both the unwrap behaviour and the
-	// stacking-prevention contract.
+	// stacking-prevention
 	hasOverride := p.MaxRetries > 0 || p.DelayAfterError > 0
 	if hasOverride {
 		maxRetries := p.MaxRetries

@@ -30,6 +30,9 @@ func (f *fakeArtifactNav) ListClusters(context.Context, string, string, int, int
 func (f *fakeArtifactNav) ListChildren(_ context.Context, _, _, name string, _, _ int) ([]nav.NavNode, int64, error) {
 	return f.children[name], int64(len(f.children[name])), nil
 }
+func (f *fakeArtifactNav) SummariesByDocIDs(context.Context, string, string, []string) map[string]string {
+	return map[string]string{}
+}
 
 // TestDeleteNav_RemovesOnlyDirectDocChildren documents the limited semantic of
 // the deprecated DeleteNav: it removes the nav_doc rows directly under root

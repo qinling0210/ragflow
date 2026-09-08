@@ -23,7 +23,8 @@ Use this file as the local operating guide for the current codebase. Prefer the 
 - `agent/`: workflow canvas, components, tools, and templates.
 - `cmd/`: Go entrypoints. `ragflow_main` is the main server/admin/ingestor binary surface; `ragflow-cli` is the CLI entrypoint.
 - `internal/`: main Go application code. Important subtrees:
-- `internal/agent/`: Go agent runtime, canvas execution, components, tool bindings, workflow helpers.
+- `internal/agent/`: Go canvas execution, components, tool bindings, chat seam (`chat` mirrors Python `rag/llm`), workflow helpers (mirrors Python `agent/` + `rag/flow`).
+- `internal/rag/advanced_rag/`: Go mirror of Python `rag/advanced_rag/` — outer agentic-search loop (`agentic_rag*.go`, `package advanced_rag`) plus `harness/` primitives (`harness/`, `harness/orchestrator/`, `harness/prompts/`).
 - `internal/cli/`: CLI parsing, HTTP transport, command execution, response formatting.
 - `internal/dao/`: Go data-access layer and persistence-facing helpers.
 - `internal/deepdoc/`: Go DeepDOC integrations, especially native-backed PDF/DOCX parsing.

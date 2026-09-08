@@ -89,6 +89,12 @@ type NavService interface {
 	ListClusters(ctx context.Context, tenantID, kbID string, page, pageSize int) ([]NavNode, int64, error)
 	// ListChildren returns the direct children of a cluster (parent_kwd=name).
 	ListChildren(ctx context.Context, tenantID, kbID, name string, page, pageSize int) ([]NavNode, int64, error)
+	// SummariesByDocIDs returns the nav_doc summary (preferred readable name, else
+	// the payload description) keyed by doc_id for the given documents. It mirrors
+	// Python dataset_api_service._nav_doc_summaries and backs the chunk_agg
+	// navigation-tree router's document labels. A doc without a nav_doc row is
+	// absent from the result.
+	SummariesByDocIDs(ctx context.Context, tenantID, kbID string, docIDs []string) map[string]string
 }
 
 var (
